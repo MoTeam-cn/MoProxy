@@ -1,0 +1,92 @@
+name: Auto Build Release
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'LICENSE'
+      - '.github/**'
+
+jobs:
+  check-and-build:
+    if: contains(github.event.head_commit.message, 'build')
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Get latest tag
+      id: get_tag
+      run: |
+        git fetch --tags
+        latest_tag=$(git tag | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+        if [ -z "$latest_tag" ]; then
+          echo "version=v0.0.0" >> $GITHUB_OUTPUT
+        else
+          echo "version=$latest_tag" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Generate new version
+      id: version
+      run: |
+        current_version=${{ steps.get_tag.outputs.version }}
+        major=$(echo $current_version | cut -d. -f1 | tr -d 'v')
+        minor=$(echo $current_version | cut -d. -f2)
+        patch=$(echo $current_version | cut -d. -f3)
+        new_patch=$((patch + 1))
+        new_version="v$major.$minor.$new_patch"
+        echo "new_version=$new_version" >> $GITHUB_OUTPUT
+
+    - name: Build Windows
+      run: |
+        GOOS=windows GOARCH=amd64 go build -o moproxy.exe -ldflags="-s -w" .
+        zip moproxy-windows-amd64.zip moproxy.exe
+
+    - name: Build Linux
+      run: |
+        GOOS=linux GOARCH=amd64 go build -o moproxy -ldflags="-s -w" .
+        tar czf moproxy-linux-amd64.tar.gz moproxy
+
+    - name: Build macOS
+      run: |
+        GOOS=darwin GOARCH=amd64 go build -o moproxy -ldflags="-s -w" .
+        tar czf moproxy-darwin-amd64.tar.gz moproxy
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.new_version }}
+        name: Release ${{ steps.version.outputs.new_version }}
+        body: |
+          ## 自动构建发布
+          
+          构建时间：${{ github.event.head_commit.timestamp }}
+          提交信息：${{ github.event.head_commit.message }}
+          
+          ### 下载
+          - Windows: moproxy-windows-amd64.zip
+          - Linux: moproxy-linux-amd64.tar.gz
+          - macOS: moproxy-darwin-amd64.tar.gz
+          
+          ### 使用说明
+          1. 下载对应系统的压缩包
+          2. 解压后获得可执行文件
+          3. 创建 config.yaml 配置文件
+          4. 运行程序
+        files: |
+          moproxy-windows-amd64.zip
+          moproxy-linux-amd64.tar.gz
+          moproxy-darwin-amd64.tar.gz
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
