@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>代理服务器监控</title>
+    <link href="https://lib.baomitu.com/bootstrap/5.1.3/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://lf26-cdn-tos.bytecdntp.com/cdn/expire-1-M/Chart.js/3.7.0/chart.min.js"></script>
+    <style>
+        .card {
+            margin-bottom: 20px;
+        }
+        .speed-value {
+            font-size: 24px;
+            font-weight: bold;
+        }
+        .url-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="container mt-4">
+        <h1 class="mb-4">代理服务器监控</h1>
+        
+        <div class="row">
+            <!-- 速度监控 -->
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        实时速度监控
+                    </div>
+                    <div class="card-body">
+                        <canvas id="speedChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 总体统计 -->
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        总体统计
+                        <span id="serverStatus" class="float-end badge bg-secondary">检查中...</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-6">
+                                <h5>总代理大小</h5>
+                                <div id="totalBytes" class="speed-value">0 MB</div>
+                            </div>
+                            <div class="col-6">
+                                <h5>当前活跃用户</h5>
+                                <div id="activeUsers" class="speed-value">0</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
+            <!-- 活跃用户列表 -->
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        活跃用户
+                    </div>
+                    <div class="card-body">
+                        <div id="userList" class="url-list"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- URL排名 -->
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        URL 排名 (按下载次数)
+                    </div>
+                    <div class="card-body">
+                        <div id="urlList" class="url-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 速度图表初始化
+        const ctx = document.getElementById('speedChart').getContext('2d');
+        const speedChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: Array(60).fill(''),
+                datasets: [{
+                    label: '下载速度 (MB/s)',
+                    data: Array(60).fill(0),
+                    borderColor: 'rgb(75, 192, 192)',
+                    tension: 0.1
+                }]
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                },
+                animation: {
+                    duration: 0
+                }
+            }
+        });
+
+        // 格式化字节大小
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // 格式化速度
+        function formatSpeed(bytesPerSecond) {
+            return formatBytes(bytesPerSecond) + '/s';
+        }
+
+        // 更新用户列表
+        function updateUserList(users) {
+            const userList = document.getElementById('userList');
+            userList.innerHTML = '';
+            
+            Object.values(users).sort((a, b) => b.current_speed - a.current_speed).forEach(user => {
+                const div = document.createElement('div');
+                div.className = 'border-bottom p-2';
+                div.innerHTML = `
+                    <div class="d-flex justify-content-between">
+                        <div>
+                            <strong>${user.ip}</strong>
+                            <small class="text-muted">(${user.download_count} 次下载)</small>
+                        </div>
+                        <div>${formatSpeed(user.current_speed)}</div>
+                    </div>
+                    <div class="small text-muted">
+                        总下载: ${formatBytes(user.total_bytes)}
+                    </div>
+                `;
+                userList.appendChild(div);
+            });
+        }
+
+        // 更新URL排名
+        function updateURLList(urls) {
+            const urlList = document.getElementById('urlList');
+            urlList.innerHTML = '';
+            
+            Object.values(urls).sort((a, b) => b.download_count - a.download_count).forEach(url => {
+                const div = document.createElement('div');
+                div.className = 'border-bottom p-2';
+                div.innerHTML = `
+                    <div>
+                        <strong>${url.download_count}次</strong> - 
+                        ${formatBytes(url.total_bytes)}
+                    </div>
+                    <div class="small text-truncate">
+                        ${url.url}
+                    </div>
+                `;
+                urlList.appendChild(div);
+            });
+        }
+
+        // 定时获取数据
+        let lastUpdateTime = 0;
+        let failedAttempts = 0;
+        
+        async function fetchStats() {
+            const serverStatus = document.getElementById('serverStatus');
+            try {
+                const response = await fetch('/api/stats');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const data = await response.json();
+                
+                // 更新服务器状态
+                serverStatus.className = 'float-end badge bg-success';
+                serverStatus.textContent = '正常';
+                failedAttempts = 0;
+                
+                // 计算时间差，用于速度计算
+                const currentTime = Date.now();
+                const timeDiff = (currentTime - lastUpdateTime) / 1000; // 转换为秒
+                lastUpdateTime = currentTime;
+                
+                // 更新速度图表（考虑实际时间间隔）
+                const speedMBps = data.current_download / 1024 / 1024;
+                speedChart.data.datasets[0].data.push(speedMBps);
+                speedChart.data.datasets[0].data.shift();
+                speedChart.update();
+                
+                // 更新总体统计
+                document.getElementById('totalBytes').textContent = formatBytes(data.total_bytes);
+                document.getElementById('activeUsers').textContent = Object.keys(data.active_users).length;
+                
+                // 更新用户列表和URL排名
+                updateUserList(data.active_users);
+                updateURLList(data.url_stats);
+            } catch (error) {
+                console.error('获取数据失败:', error);
+                failedAttempts++;
+                
+                // 更新服务器状态显示
+                if (failedAttempts >= 3) {
+                    serverStatus.className = 'float-end badge bg-danger';
+                    serverStatus.textContent = '连接失败';
+                } else {
+                    serverStatus.className = 'float-end badge bg-warning';
+                    serverStatus.textContent = '重试中...';
+                }
+            }
+        }
+
+        // 启动定时更新 (5秒间隔)
+        setInterval(fetchStats, 5000);
+        fetchStats(); // 立即执行一次
+    </script>
+</body>
+</html> 
