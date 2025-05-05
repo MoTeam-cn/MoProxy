@@ -15,7 +15,9 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -352,6 +354,8 @@ func handleDownload(c *gin.Context) {
 type rateLimitedReader struct {
 	reader      io.Reader
 	bytesPerSec int64
+	lastRead    time.Time
+	bytesRead   int64
 }
 
 func (r *rateLimitedReader) Read(p []byte) (n int, err error) {
@@ -359,15 +363,38 @@ func (r *rateLimitedReader) Read(p []byte) (n int, err error) {
 		return r.reader.Read(p)
 	}
 
-	startTime := time.Now()
+	// 如果是首次读取，初始化lastRead
+	if r.lastRead.IsZero() {
+		r.lastRead = time.Now()
+		r.bytesRead = 0
+	}
+
+	// 计算自上次读取以来应该经过的时间
+	expectedTime := time.Duration(float64(r.bytesRead) / float64(r.bytesPerSec) * float64(time.Second))
+	actualTime := time.Since(r.lastRead)
+
+	// 如果读取太快，需要等待
+	if actualTime < expectedTime {
+		sleepTime := expectedTime - actualTime
+		if sleepTime > 100*time.Millisecond {
+			log.Printf("[限速] 降速等待: %v", sleepTime)
+		}
+		time.Sleep(sleepTime)
+	}
+
+	// 读取数据
 	n, err = r.reader.Read(p)
 	if n > 0 {
-		expectedTime := time.Duration(float64(n) / float64(r.bytesPerSec) * float64(time.Second))
-		elapsed := time.Since(startTime)
-		if elapsed < expectedTime {
-			time.Sleep(expectedTime - elapsed)
+		r.bytesRead += int64(n)
+		// 每10MB记录一次当前速度
+		if r.bytesRead%(10*1024*1024) < int64(n) {
+			elapsed := time.Since(r.lastRead)
+			currentSpeed := float64(r.bytesRead) / elapsed.Seconds() / 1024 / 1024
+			log.Printf("[限速] 当前速度: %.2f MB/s, 目标速度: %.2f MB/s",
+				currentSpeed, float64(r.bytesPerSec)/1024/1024)
 		}
 	}
+
 	return
 }
 
@@ -498,6 +525,9 @@ func handleFile(c *gin.Context) {
 	timestamp, err := strconv.ParseInt(c.Query("time"), 10, 64)
 	xs := c.Query("xs") == "1"
 
+	// 缩短日志输出
+	log.Printf("[下载] 开始处理: %s, 限速模式: %v", filename, xs)
+
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -538,6 +568,17 @@ func handleFile(c *gin.Context) {
 		return
 	}
 
+	// 创建一个具有超时设置的客户端
+	client := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 20,
+			IdleConnTimeout:     30 * time.Second,
+			DisableCompression:  true, // 对于大文件传输禁用压缩可能提高性能
+		},
+		Timeout: 30 * time.Second,
+	}
+
 	req, err := http.NewRequest("GET", downloadData.URL, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -549,10 +590,35 @@ func handleFile(c *gin.Context) {
 
 	req.Header.Set("User-Agent", downloadData.UA)
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	req.Header.Set("Accept-Encoding", "identity") // 避免使用压缩，可能会提高传输速度
 	req.Header.Set("Connection", "keep-alive")
 
-	resp, err := http.DefaultClient.Do(req)
+	// 只有在未启用限速的情况下才支持多线程下载
+	if !config.SpeedLimit.Enabled {
+		// 处理Range请求头，支持多线程下载
+		if rangeHeader := c.GetHeader("Range"); rangeHeader != "" {
+			// 截取Range头的前30个字符以避免过长日志
+			displayRange := rangeHeader
+			if len(rangeHeader) > 30 {
+				displayRange = rangeHeader[:30] + "..."
+			}
+			log.Printf("[下载] Range请求: %s", displayRange)
+			req.Header.Set("Range", rangeHeader)
+		} else {
+			log.Printf("[下载] 单线程下载")
+		}
+	} else {
+		log.Printf("[下载] 限速模式已启用，禁用多线程")
+	}
+
+	// 截取URL，只显示域名而不是完整URL
+	parsedURL, _ := url.Parse(downloadData.URL)
+	log.Printf("[下载] 请求源站: %s", parsedURL.Host)
+
+	startTime := time.Now()
+	resp, err := client.Do(req)
+	log.Printf("[下载] 源站响应: %v", time.Since(startTime))
+
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -562,7 +628,11 @@ func handleFile(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// 判断是否为Range请求的响应
+	isPartialContent := resp.StatusCode == http.StatusPartialContent
+	log.Printf("[下载] 状态码: %d, 部分内容: %v", resp.StatusCode, isPartialContent)
+
+	if !isPartialContent && resp.StatusCode != http.StatusOK {
 		c.JSON(http.StatusBadGateway, gin.H{
 			"success": false,
 			"message": fmt.Sprintf("源服务器返回错误状态码: %d", resp.StatusCode),
@@ -570,11 +640,38 @@ func handleFile(c *gin.Context) {
 		return
 	}
 
+	// 设置响应头
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, url.QueryEscape(downloadData.Filename)))
 	c.Header("Content-Type", resp.Header.Get("Content-Type"))
-	if resp.Header.Get("Content-Length") != "" {
-		c.Header("Content-Length", resp.Header.Get("Content-Length"))
+
+	// 只有在未启用限速的情况下才提供多线程下载支持
+	if !config.SpeedLimit.Enabled {
+		// 复制所有与Range相关的响应头
+		c.Header("Accept-Ranges", "bytes")
+		if resp.Header.Get("Content-Range") != "" {
+			contentRange := resp.Header.Get("Content-Range")
+			// 截取Content-Range头，避免过长日志
+			displayRange := contentRange
+			if len(contentRange) > 30 {
+				displayRange = contentRange[:30] + "..."
+			}
+			c.Header("Content-Range", contentRange)
+			log.Printf("[下载] Content-Range: %s", displayRange)
+		}
 	}
+
+	if resp.Header.Get("Content-Length") != "" {
+		contentLength := resp.Header.Get("Content-Length")
+		c.Header("Content-Length", contentLength)
+
+		// 将字节数转换为MB显示
+		bytes, _ := strconv.ParseInt(contentLength, 10, 64)
+		fileSizeMB := float64(bytes) / 1024 / 1024
+		log.Printf("[下载] 文件大小: %.2f MB", fileSizeMB)
+	}
+
+	// 设置正确的状态码
+	c.Status(resp.StatusCode)
 
 	var reader io.Reader = resp.Body
 	if config.SpeedLimit.Enabled {
@@ -582,22 +679,62 @@ func handleFile(c *gin.Context) {
 		if xs {
 			speed = config.SpeedLimit.LimitedSpeed
 		}
+		speedMB := float64(speed) / 1024 / 1024
+		log.Printf("[下载] 启用限速: %.2f MB/s", speedMB)
 		reader = &rateLimitedReader{
 			reader:      resp.Body,
 			bytesPerSec: speed,
+		}
+	} else {
+		log.Printf("[下载] 不限速")
+	}
+
+	// 仅在非频繁场景下更新数据库统计
+	updateStats := func(bytes int64) {
+		// 每10MB更新一次统计，减少更新频率
+		const updateThreshold = 10 * 1024 * 1024
+
+		// 对传输的字节进行累加
+		atomic.AddInt64(&stats.TotalBytes, bytes)
+
+		// 只有达到阈值才进行完整统计更新
+		if atomic.LoadInt64(&stats.TotalBytes)%updateThreshold < int64(bytes) {
+			ip := c.ClientIP()
+			stats.UpdateUserStats(ip, bytes)
+			stats.UpdateURLStats(downloadData.URL, bytes)
 		}
 	}
 
 	ip := c.ClientIP()
 	counter := &CountingReader{
 		Reader: reader,
-		OnRead: func(bytes int64) {
-			stats.UpdateUserStats(ip, bytes)
-			stats.UpdateURLStats(downloadData.URL, bytes)
-		},
+		OnRead: updateStats,
 	}
 
-	io.Copy(c.Writer, counter)
+	log.Printf("[下载] 开始传输数据")
+	transferStart := time.Now()
+
+	// 使用更大的缓冲区进行数据传输
+	buf := make([]byte, 256*1024) // 256KB缓冲区，比默认的32KB大很多
+	written, err := io.CopyBuffer(c.Writer, counter, buf)
+
+	transferDuration := time.Since(transferStart)
+	transferSpeed := float64(written) / transferDuration.Seconds() / 1024 / 1024
+	writtenMB := float64(written) / 1024 / 1024
+	log.Printf("[下载] 传输完成: %.2f MB, 耗时: %v, 速度: %.2f MB/s", writtenMB, transferDuration, transferSpeed)
+
+	// 确保最终的统计数据被正确记录
+	stats.UpdateUserStats(ip, 0)
+	stats.UpdateURLStats(downloadData.URL, 0)
+
+	if err != nil {
+		if strings.Contains(err.Error(), "connection was aborted") ||
+			strings.Contains(err.Error(), "connection was forcibly closed") {
+			log.Printf("[下载] 客户端断开连接")
+		} else {
+			log.Printf("[下载] 传输错误: %v", err)
+		}
+	}
 }
 
 // 计数器Reader
@@ -612,6 +749,44 @@ func (r *CountingReader) Read(p []byte) (n int, err error) {
 		r.OnRead(int64(n))
 	}
 	return
+}
+
+// 自定义GIN日志中间件，减少冗长的URL日志
+func customLoggerMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		path := c.Request.URL.Path
+
+		// 如果是文件下载路径，则不记录查询参数
+		if strings.HasPrefix(path, "/file/") || strings.HasPrefix(path, "/download/") {
+			c.Next()
+			log.Printf("[GIN] %s | %d | %s | %s",
+				c.Request.Method,
+				c.Writer.Status(),
+				time.Since(start),
+				path)
+			return
+		}
+
+		// 对于其他路径，正常记录查询参数
+		raw := c.Request.URL.RawQuery
+		c.Next()
+
+		if raw != "" {
+			// 限制查询参数长度
+			if len(raw) > 50 {
+				raw = raw[:50] + "..."
+			}
+			path = path + "?" + raw
+		}
+
+		log.Printf("[GIN] %s | %d | %s | %s",
+			c.Request.Method,
+			c.Writer.Status(),
+			time.Since(start),
+			path,
+		)
+	}
 }
 
 func main() {
@@ -635,25 +810,8 @@ func main() {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	// 自定义日志中间件
-	r.Use(func(c *gin.Context) {
-		start := time.Now()
-		path := c.Request.URL.Path
-		raw := c.Request.URL.RawQuery
-
-		c.Next()
-
-		if raw != "" {
-			path = path + "?" + raw
-		}
-
-		log.Printf("[GIN] %s | %d | %s | %s",
-			c.Request.Method,
-			c.Writer.Status(),
-			time.Since(start),
-			path,
-		)
-	})
+	// 使用自定义日志中间件
+	r.Use(customLoggerMiddleware())
 
 	// 使用内置的静态文件
 	staticFS, err := fs.Sub(staticFiles, "static")
