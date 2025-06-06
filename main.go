@@ -41,6 +41,49 @@ type Config struct {
 	} `yaml:"speed_limit"`
 }
 
+// PikPak API 请求参数
+type PikPakDownloadRequest struct {
+	FileID       string `json:"file_id"`
+	AccessToken  string `json:"access_token"`
+	UserAgent    string `json:"user_agent"`
+	DeviceID     string `json:"device_id"`
+	CaptchaToken string `json:"captcha_token"`
+}
+
+// PikPak API 响应结构
+type PikPakFileResponse struct {
+	WebContentLink string `json:"web_content_link"`
+	Medias         []struct {
+		MediaID   string `json:"media_id"`
+		MediaName string `json:"media_name"`
+		Video     struct {
+			Height     int     `json:"height"`
+			Width      int     `json:"width"`
+			Duration   int     `json:"duration"`
+			BitRate    int     `json:"bit_rate"`
+			FrameRate  float64 `json:"frame_rate"`
+			VideoCodec string  `json:"video_codec"`
+			AudioCodec string  `json:"audio_codec"`
+			VideoType  string  `json:"video_type"`
+		} `json:"video"`
+		Link struct {
+			URL    string `json:"url"`
+			Token  string `json:"token"`
+			Expire string `json:"expire"`
+		} `json:"link"`
+		NeedMoreQuota  bool     `json:"need_more_quota"`
+		VipTypes       []string `json:"vip_types"`
+		RedirectLink   string   `json:"redirect_link"`
+		IconLink       string   `json:"icon_link"`
+		IsDefault      bool     `json:"is_default"`
+		Priority       int      `json:"priority"`
+		IsOrigin       bool     `json:"is_origin"`
+		ResolutionName string   `json:"resolution_name"`
+		IsVisible      bool     `json:"is_visible"`
+		Category       string   `json:"category"`
+	} `json:"medias"`
+}
+
 var (
 	config Config
 	stats  = &Stats{
@@ -737,6 +780,96 @@ func handleFile(c *gin.Context) {
 	}
 }
 
+// 处理 PikPak 下载请求
+func handlePikPakDownload(c *gin.Context) {
+	var req PikPakDownloadRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "无效的请求参数",
+		})
+		return
+	}
+
+	// 构建 PikPak API 请求
+	apiURL := fmt.Sprintf("https://api-drive.mypikpak.net/drive/v1/files/%s", req.FileID)
+	pikpakReq, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "创建请求失败",
+		})
+		return
+	}
+
+	// 添加查询参数
+	q := pikpakReq.URL.Query()
+	q.Add("_magic", "2021")
+	q.Add("usage", "FETCH")
+	q.Add("thumbnail_size", "SIZE_LARGE")
+	pikpakReq.URL.RawQuery = q.Encode()
+
+	// 设置请求头
+	pikpakReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
+	pikpakReq.Header.Set("User-Agent", req.UserAgent)
+	pikpakReq.Header.Set("X-Device-ID", req.DeviceID)
+	if req.CaptchaToken != "" {
+		pikpakReq.Header.Set("X-Captcha-Token", req.CaptchaToken)
+	}
+
+	// 发送请求
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+	resp, err := client.Do(pikpakReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "请求 PikPak API 失败: " + err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	// 读取响应
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "读取响应失败: " + err.Error(),
+		})
+		return
+	}
+
+	// 检查响应状态码
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(resp.StatusCode, gin.H{
+			"success": false,
+			"message": fmt.Sprintf("PikPak API 返回错误状态码: %d, 响应: %s", resp.StatusCode, string(body)),
+		})
+		return
+	}
+
+	// 解析响应
+	var pikpakResp PikPakFileResponse
+	if err := json.Unmarshal(body, &pikpakResp); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "解析响应失败: " + err.Error(),
+		})
+		return
+	}
+
+	// 返回下载链接
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"web_content_link": pikpakResp.WebContentLink,
+			"medias":           pikpakResp.Medias,
+		},
+	})
+}
+
 // 计数器Reader
 type CountingReader struct {
 	io.Reader
@@ -842,6 +975,7 @@ func main() {
 	{
 		apiGroup.POST("/test", testConnection)
 		apiGroup.POST("/add", addDownload)
+		apiGroup.POST("/pikpak/down", handlePikPakDownload)
 	}
 
 	// 下载路由不需要密码验证，因为已经有签名验证
