@@ -9,9 +9,6 @@ on:
       - 'LICENSE'
     tags:
       - 'v*'
-  create:
-    tags:
-      - 'v*'
 
 jobs:
   check-and-build:
