@@ -780,6 +780,100 @@ func handleFile(c *gin.Context) {
 	}
 }
 
+// HTTP代理请求结构
+type ProxyRequest struct {
+	URL     string            `json:"url"`
+	Method  string            `json:"method"`
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body"`
+}
+
+// 处理HTTP代理请求
+func handleProxyRequest(c *gin.Context) {
+	var req ProxyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "无效的请求参数",
+		})
+		return
+	}
+
+	// 验证URL
+	if req.URL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "URL不能为空",
+		})
+		return
+	}
+
+	// 默认方法为GET
+	if req.Method == "" {
+		req.Method = "GET"
+	}
+
+	// 创建HTTP客户端
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	// 创建请求体
+	var bodyReader io.Reader
+	if req.Body != "" {
+		bodyReader = strings.NewReader(req.Body)
+	}
+
+	// 创建HTTP请求
+	proxyReq, err := http.NewRequest(req.Method, req.URL, bodyReader)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "创建请求失败: " + err.Error(),
+		})
+		return
+	}
+
+	// 设置请求头
+	for key, value := range req.Headers {
+		proxyReq.Header.Set(key, value)
+	}
+
+	// 如果没有设置User-Agent，使用默认值
+	if proxyReq.Header.Get("User-Agent") == "" {
+		proxyReq.Header.Set("User-Agent", "MoProxy/1.0")
+	}
+
+	log.Printf("[代理] %s %s", req.Method, req.URL)
+
+	// 发送请求
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "请求失败: " + err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	// 复制响应头到客户端
+	for key, values := range resp.Header {
+		for _, value := range values {
+			c.Header(key, value)
+		}
+	}
+
+	// 设置状态码
+	c.Status(resp.StatusCode)
+
+	// 直接流式传输响应体，不包装成JSON
+	_, err = io.Copy(c.Writer, resp.Body)
+	if err != nil {
+		log.Printf("[代理] 传输响应失败: %v", err)
+	}
+}
+
 // 处理 PikPak 下载请求
 func handlePikPakDownload(c *gin.Context) {
 	var req PikPakDownloadRequest
@@ -976,6 +1070,7 @@ func main() {
 		apiGroup.POST("/test", testConnection)
 		apiGroup.POST("/add", addDownload)
 		apiGroup.POST("/pikpak/down", handlePikPakDownload)
+		apiGroup.POST("/proxy", handleProxyRequest)
 	}
 
 	// 下载路由不需要密码验证，因为已经有签名验证
