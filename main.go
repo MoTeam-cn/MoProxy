@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/md5"
+	"crypto/rand"
 	"database/sql"
 	"embed"
 	"encoding/base64"
@@ -246,6 +249,182 @@ func calculateFileSign(filename string, timestamp int64) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// 从URL响应头获取文件名
+func getFilenameFromURL(targetURL, userAgent string) string {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	req, err := http.NewRequest("HEAD", targetURL, nil)
+	if err != nil {
+		return ""
+	}
+
+	if userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
+	} else {
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	// 从 Content-Disposition 头获取文件名
+	contentDisposition := resp.Header.Get("Content-Disposition")
+	if contentDisposition != "" {
+		// 优先处理 filename*=UTF-8''xxx 格式（RFC 5987）
+		if idx := strings.Index(contentDisposition, "filename*=UTF-8''"); idx != -1 {
+			filename := contentDisposition[idx+17:]
+			// 去除可能的分号和空格
+			if semicolonIdx := strings.Index(filename, ";"); semicolonIdx != -1 {
+				filename = filename[:semicolonIdx]
+			}
+			filename = strings.TrimSpace(filename)
+			if decoded, err := url.QueryUnescape(filename); err == nil {
+				filename = decoded
+			}
+			if filename != "" {
+				return filename
+			}
+		}
+		// 处理 filename="xxx" 或 filename=xxx 格式
+		if idx := strings.Index(contentDisposition, "filename="); idx != -1 {
+			filename := contentDisposition[idx+9:]
+			// 去除引号
+			filename = strings.Trim(filename, `"'`)
+			// 去除可能的分号和空格
+			if semicolonIdx := strings.Index(filename, ";"); semicolonIdx != -1 {
+				filename = filename[:semicolonIdx]
+			}
+			filename = strings.TrimSpace(filename)
+			// URL解码
+			if decoded, err := url.QueryUnescape(filename); err == nil {
+				filename = decoded
+			}
+			if filename != "" {
+				return filename
+			}
+		}
+	}
+
+	// 如果从响应头获取不到，尝试从URL路径中提取
+	parsedURL, err := url.Parse(targetURL)
+	if err == nil {
+		path := parsedURL.Path
+		if path != "" && path != "/" {
+			parts := strings.Split(path, "/")
+			if len(parts) > 0 {
+				lastPart := parts[len(parts)-1]
+				if lastPart != "" {
+					// URL解码
+					if decoded, err := url.QueryUnescape(lastPart); err == nil {
+						return decoded
+					}
+					return lastPart
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// 生成AES密钥（从密码生成32字节密钥）
+func generateAESKey(password string) []byte {
+	hash := md5.Sum([]byte(password))
+	key := make([]byte, 32)
+	copy(key, hash[:])
+	// 如果密码长度超过16字节，继续填充
+	if len(password) > 16 {
+		hash2 := md5.Sum([]byte(password + "salt"))
+		copy(key[16:], hash2[:])
+	}
+	return key
+}
+
+// AES加密
+func encryptAES(plaintext []byte) (string, error) {
+	key := generateAESKey(config.Server.Password)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	// 使用PKCS7填充
+	plaintext = pkcs7Padding(plaintext, aes.BlockSize)
+
+	// 生成随机IV
+	ciphertext := make([]byte, aes.BlockSize+len(plaintext))
+	iv := ciphertext[:aes.BlockSize]
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return "", err
+	}
+
+	// 加密
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext[aes.BlockSize:], plaintext)
+
+	// 使用URL-safe base64编码
+	return base64.URLEncoding.EncodeToString(ciphertext), nil
+}
+
+// AES解密
+func decryptAES(ciphertextStr string) ([]byte, error) {
+	// 解码base64
+	ciphertext, err := base64.URLEncoding.DecodeString(ciphertextStr)
+	if err != nil {
+		return nil, err
+	}
+
+	key := generateAESKey(config.Server.Password)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ciphertext) < aes.BlockSize {
+		return nil, fmt.Errorf("密文太短")
+	}
+
+	// 提取IV
+	iv := ciphertext[:aes.BlockSize]
+	ciphertext = ciphertext[aes.BlockSize:]
+
+	// 解密
+	mode := cipher.NewCBCDecrypter(block, iv)
+	plaintext := make([]byte, len(ciphertext))
+	mode.CryptBlocks(plaintext, ciphertext)
+
+	// 去除PKCS7填充
+	return pkcs7Unpadding(plaintext), nil
+}
+
+// PKCS7填充
+func pkcs7Padding(data []byte, blockSize int) []byte {
+	padding := blockSize - len(data)%blockSize
+	padtext := make([]byte, padding)
+	for i := range padtext {
+		padtext[i] = byte(padding)
+	}
+	return append(data, padtext...)
+}
+
+// PKCS7去填充
+func pkcs7Unpadding(data []byte) []byte {
+	length := len(data)
+	if length == 0 {
+		return data
+	}
+	unpadding := int(data[length-1])
+	if unpadding > length {
+		return data
+	}
+	return data[:(length - unpadding)]
+}
+
 // 验证密码中间件
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -301,6 +480,16 @@ func addDownload(c *gin.Context) {
 
 	timestamp := time.Now().Unix()
 
+	// 如果filename为空，尝试从URL响应头获取
+	filename := downloadInfo.Filename
+	if filename == "" {
+		filename = getFilenameFromURL(downloadInfo.URL, downloadInfo.UA)
+		// 如果还是获取不到，使用默认文件名
+		if filename == "" {
+			filename = "download"
+		}
+	}
+
 	downloadData := struct {
 		URL      string `json:"url"`
 		UA       string `json:"ua"`
@@ -308,7 +497,7 @@ func addDownload(c *gin.Context) {
 	}{
 		URL:      downloadInfo.URL,
 		UA:       downloadInfo.UA,
-		Filename: downloadInfo.Filename,
+		Filename: filename,
 	}
 
 	jsonData, err := json.Marshal(downloadData)
@@ -320,14 +509,33 @@ func addDownload(c *gin.Context) {
 		return
 	}
 
-	urlData := base64.URLEncoding.EncodeToString(jsonData)
+	// 使用AES加密而不是base64
+	urlData, err := encryptAES(jsonData)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "加密失败",
+		})
+		return
+	}
 	downloadPath := fmt.Sprintf("/download/%s", urlData)
 	sign := calculateDownloadSign(downloadPath, timestamp)
+
+	// 构建完整的URL（域名+路径）
+	scheme := "http"
+	if c.GetHeader("X-Forwarded-Proto") == "https" || c.Request.TLS != nil {
+		scheme = "https"
+	}
+	host := c.GetHeader("Host")
+	if host == "" {
+		host = c.Request.Host
+	}
+	fullURL := fmt.Sprintf("%s://%s%s?sign=%s&time=%d", scheme, host, downloadPath, sign, timestamp)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data": gin.H{
-			"download_url": fmt.Sprintf("%s?sign=%s&time=%d", downloadPath, sign, timestamp),
+			"download_url": fullURL,
 		},
 	})
 }
@@ -357,11 +565,12 @@ func handleDownload(c *gin.Context) {
 		return
 	}
 
-	decodedBytes, err := base64.URLEncoding.DecodeString(urlData)
+	// 使用AES解密
+	decodedBytes, err := decryptAES(urlData)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
-			"message": "无效的URL编码",
+			"message": "解密失败",
 		})
 		return
 	}
@@ -383,8 +592,10 @@ func handleDownload(c *gin.Context) {
 	fileTimestamp := time.Now().Unix()
 	fileSign := calculateFileSign(downloadData.Filename, fileTimestamp)
 
+	// urlData已经是AES加密后的字符串，直接使用，不需要base64
+	// 但作为路径参数需要进行URL编码
 	redirectURL := fmt.Sprintf("/file/%s?filename=%s&xsign=%s&time=%d",
-		urlData,
+		url.QueryEscape(urlData),
 		url.QueryEscape(downloadData.Filename),
 		fileSign,
 		fileTimestamp,
@@ -588,11 +799,12 @@ func handleFile(c *gin.Context) {
 		return
 	}
 
-	decodedBytes, err := base64.URLEncoding.DecodeString(urlData)
+	// 使用AES解密
+	decodedBytes, err := decryptAES(urlData)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
-			"message": "无效的URL编码",
+			"message": "解密失败",
 		})
 		return
 	}
@@ -984,14 +1196,21 @@ func customLoggerMiddleware() gin.HandlerFunc {
 		start := time.Now()
 		path := c.Request.URL.Path
 
-		// 如果是文件下载路径，则不记录查询参数
-		if strings.HasPrefix(path, "/file/") || strings.HasPrefix(path, "/download/") {
+		// 如果是文件下载路径，只显示路径类型，避免日志过长
+		if strings.HasPrefix(path, "/file/") {
 			c.Next()
-			log.Printf("[GIN] %s | %d | %s | %s",
+			log.Printf("[GIN] %s | %d | %s | /file/...",
 				c.Request.Method,
 				c.Writer.Status(),
-				time.Since(start),
-				path)
+				time.Since(start))
+			return
+		}
+		if strings.HasPrefix(path, "/download/") {
+			c.Next()
+			log.Printf("[GIN] %s | %d | %s | /download/...",
+				c.Request.Method,
+				c.Writer.Status(),
+				time.Since(start))
 			return
 		}
 
