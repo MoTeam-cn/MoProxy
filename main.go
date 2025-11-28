@@ -896,7 +896,17 @@ func handleFile(c *gin.Context) {
 	}
 
 	// 设置响应头
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, url.QueryEscape(downloadData.Filename)))
+	// 使用 RFC 5987 格式支持非 ASCII 字符，避免文件名出现 % 编码
+	// 使用 downloadData.Filename 作为实际文件名（而不是查询参数中的 filename）
+	actualFilename := downloadData.Filename
+	// 转义标准格式中的引号
+	safeFilename := strings.ReplaceAll(actualFilename, `"`, `\"`)
+	// 使用 RFC 5987 格式（filename*=UTF-8''encoded），现代浏览器会优先使用此格式
+	// 同时提供标准格式作为兼容性回退
+	disposition := fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`,
+		safeFilename,
+		url.QueryEscape(actualFilename)) // RFC 5987 格式使用 percent-encoding，但浏览器会解码显示
+	c.Header("Content-Disposition", disposition)
 	c.Header("Content-Type", resp.Header.Get("Content-Type"))
 
 	// 只有在未启用限速的情况下才提供多线程下载支持
